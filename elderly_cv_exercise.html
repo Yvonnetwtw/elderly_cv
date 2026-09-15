@@ -1,0 +1,317 @@
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+  <title>銀髮運動 CV 紀錄</title>
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/drawing_utils/drawing_utils.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/pose/pose.js"></script>
+  <style>
+    :root { font-family: Arial, "Noto Sans TC", sans-serif; }
+    body { margin: 0; background: #f5f7f8; color: #222; }
+    .wrap { max-width: 760px; margin: 0 auto; padding: 18px; }
+    h1 { font-size: 30px; margin: 8px 0 18px; text-align:center; }
+    .card { background:#fff; border-radius:18px; padding:16px; margin-bottom:14px; box-shadow:0 2px 10px rgba(0,0,0,.08); }
+    label { display:block; font-size:22px; margin-bottom:8px; }
+    input, select, button {
+      width:100%; box-sizing:border-box; font-size:22px; padding:14px;
+      border-radius:14px; border:1px solid #bbb; margin-bottom:12px;
+    }
+    button { font-weight:700; cursor:pointer; }
+    .start { background:#1f8f4e; color:white; border:none; }
+    .stop { background:#c0392b; color:white; border:none; }
+    .save { background:#2257a6; color:white; border:none; }
+    .stats { display:grid; grid-template-columns:1fr 1fr; gap:12px; }
+    .stat { background:#eef3f6; border-radius:16px; padding:18px; text-align:center; }
+    .stat .n { font-size:42px; font-weight:800; }
+    .stat .t { font-size:18px; margin-top:4px; }
+    .videoBox { position:relative; width:100%; aspect-ratio:3/4; background:#111; overflow:hidden; border-radius:18px; }
+    video, canvas { position:absolute; inset:0; width:100%; height:100%; object-fit:cover; transform:scaleX(-1); }
+    #status { font-size:20px; line-height:1.5; }
+    .hint { font-size:17px; color:#555; line-height:1.5; }
+  </style>
+</head>
+<body>
+<div class="wrap">
+  <h1>銀髮運動 CV 紀錄</h1>
+
+  <div class="card">
+    <label for="nickname">長者暱稱</label>
+    <input id="nickname" placeholder="例如：王阿姨" />
+
+    <label for="exercise">選擇運動</label>
+    <select id="exercise">
+      <option value="march">原地踏步</option>
+      <option value="leg_raise">抬腿</option>
+      <option value="arm_raise">抬手</option>
+      <option value="sit_stand">坐下站起</option>
+    </select>
+
+    <button class="start" id="startBtn">開始運動</button>
+    <button class="stop" id="stopBtn" disabled>停止</button>
+  </div>
+
+  <div class="card stats">
+    <div class="stat">
+      <div class="n" id="count">0</div>
+      <div class="t">次數</div>
+    </div>
+    <div class="stat">
+      <div class="n" id="timer">00:00</div>
+      <div class="t">運動時間</div>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="videoBox">
+      <video id="video" playsinline></video>
+      <canvas id="canvas"></canvas>
+    </div>
+    <p class="hint">請將手機固定，讓全身盡量出現在畫面中。此版本以一般手機攝影機 + MediaPipe Pose 做示範。</p>
+  </div>
+
+  <div class="card">
+    <div id="status">尚未開始。</div>
+    <button class="save" id="saveBtn" disabled>儲存本次紀錄</button>
+  </div>
+</div>
+
+<script>
+/*
+  ★ 部署 GAS Web App 後，把網址貼到這裡。
+  例如：https://script.google.com/macros/s/XXXXX/exec
+*/
+const GAS_URL = "https://script.google.com/macros/s/AKfycbxUfbDM3Sona4wqpA1Uym0E4jB6emk0ibgzDdbLZtsjJ-OOpR9cAubv1rNYRRcBw1J45g/exec";
+
+const video = document.getElementById('video');
+const canvas = document.getElementById('canvas');
+const ctx = canvas.getContext('2d');
+const countEl = document.getElementById('count');
+const timerEl = document.getElementById('timer');
+const statusEl = document.getElementById('status');
+const exerciseEl = document.getElementById('exercise');
+
+let pose, camera;
+let running = false;
+let count = 0;
+let startAt = null;
+let endAt = null;
+let timerHandle = null;
+let lastCountAt = 0;
+
+// 狀態鎖，避免一個動作連續重複計數
+let leftUp = false, rightUp = false, armsUp = false, seated = false;
+
+function angle(a, b, c) {
+  const ab = {x:a.x-b.x, y:a.y-b.y};
+  const cb = {x:c.x-b.x, y:c.y-b.y};
+  const dot = ab.x*cb.x + ab.y*cb.y;
+  const mag = Math.hypot(ab.x,ab.y) * Math.hypot(cb.x,cb.y);
+  if (!mag) return 0;
+  return Math.acos(Math.max(-1, Math.min(1, dot/mag))) * 180/Math.PI;
+}
+
+function canCount(ms=450) {
+  const now = Date.now();
+  if (now-lastCountAt < ms) return false;
+  lastCountAt = now;
+  return true;
+}
+
+function addCount(label) {
+  if (!running) return;
+  count++;
+  countEl.textContent = count;
+  statusEl.textContent = `偵測到：${label}，目前 ${count} 次`;
+}
+
+function detectExercise(lm) {
+  if (!running || !lm || lm.length < 33) return;
+
+  const LS=lm[11], RS=lm[12], LW=lm[15], RW=lm[16];
+  const LH=lm[23], RH=lm[24], LK=lm[25], RK=lm[26], LA=lm[27], RA=lm[28];
+
+  // visibility 過低時不要判斷
+  const needed = [LS,RS,LW,RW,LH,RH,LK,RK,LA,RA];
+  if (needed.some(p => (p.visibility ?? 1) < 0.45)) {
+    statusEl.textContent = "請退後一些，讓全身清楚出現在畫面中。";
+    return;
+  }
+
+  const type = exerciseEl.value;
+
+  if (type === "arm_raise") {
+    const up = (LW.y < LS.y && RW.y < RS.y);
+    const down = (LW.y > LS.y + 0.08 && RW.y > RS.y + 0.08);
+    if (up && !armsUp) armsUp = true;
+    if (down && armsUp && canCount()) {
+      armsUp = false;
+      addCount("抬手");
+    }
+  }
+
+  if (type === "march" || type === "leg_raise") {
+    // 膝蓋抬高：膝蓋接近或高於髖部附近。
+    // 此門檻可依實測再調整。
+    const leftIsUp  = LK.y < LH.y + 0.10;
+    const rightIsUp = RK.y < RH.y + 0.10;
+    const leftDown  = LK.y > LH.y + 0.22;
+    const rightDown = RK.y > RH.y + 0.22;
+
+    if (leftIsUp && !leftUp) leftUp = true;
+    if (leftDown && leftUp && canCount(300)) {
+      leftUp = false;
+      addCount(type === "march" ? "左腳踏步" : "左腿抬腿");
+    }
+
+    if (rightIsUp && !rightUp) rightUp = true;
+    if (rightDown && rightUp && canCount(300)) {
+      rightUp = false;
+      addCount(type === "march" ? "右腳踏步" : "右腿抬腿");
+    }
+  }
+
+  if (type === "sit_stand") {
+    const leftKneeAngle  = angle(LH, LK, LA);
+    const rightKneeAngle = angle(RH, RK, RA);
+    const kneeAngle = (leftKneeAngle + rightKneeAngle) / 2;
+
+    // 坐姿約 70–120 度；站姿通常 >150 度
+    if (kneeAngle < 120) seated = true;
+    if (seated && kneeAngle > 155 && canCount(900)) {
+      seated = false;
+      addCount("坐下站起");
+    }
+  }
+}
+
+function onResults(results) {
+  canvas.width = video.videoWidth || 480;
+  canvas.height = video.videoHeight || 640;
+
+  ctx.save();
+  ctx.clearRect(0,0,canvas.width,canvas.height);
+  if (results.poseLandmarks) {
+    drawConnectors(ctx, results.poseLandmarks, POSE_CONNECTIONS, {lineWidth:3});
+    drawLandmarks(ctx, results.poseLandmarks, {lineWidth:2, radius:3});
+    detectExercise(results.poseLandmarks);
+  }
+  ctx.restore();
+}
+
+async function initPose() {
+  if (pose) return;
+  pose = new Pose({
+    locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/pose/${file}`
+  });
+  pose.setOptions({
+    modelComplexity: 1,
+    smoothLandmarks: true,
+    enableSegmentation: false,
+    minDetectionConfidence: 0.6,
+    minTrackingConfidence: 0.6
+  });
+  pose.onResults(onResults);
+
+  camera = new Camera(video, {
+    onFrame: async () => { await pose.send({image: video}); },
+    width: 480,
+    height: 640
+  });
+}
+
+function resetSession() {
+  count = 0;
+  countEl.textContent = '0';
+  leftUp = rightUp = armsUp = seated = false;
+  lastCountAt = 0;
+}
+
+function updateTimer() {
+  if (!running || !startAt) return;
+  const sec = Math.floor((Date.now()-startAt.getTime())/1000);
+  const m = String(Math.floor(sec/60)).padStart(2,'0');
+  const s = String(sec%60).padStart(2,'0');
+  timerEl.textContent = `${m}:${s}`;
+}
+
+document.getElementById('startBtn').addEventListener('click', async () => {
+  const nickname = document.getElementById('nickname').value.trim();
+  if (!nickname) return alert('請先輸入長者暱稱。');
+
+  try {
+    await initPose();
+    await camera.start();
+    resetSession();
+    startAt = new Date();
+    endAt = null;
+    running = true;
+    document.getElementById('startBtn').disabled = true;
+    document.getElementById('stopBtn').disabled = false;
+    document.getElementById('saveBtn').disabled = true;
+    statusEl.textContent = '辨識中，請開始動作。';
+    clearInterval(timerHandle);
+    timerHandle = setInterval(updateTimer, 500);
+  } catch(err) {
+    console.error(err);
+    alert('無法開啟攝影機。請確認瀏覽器已允許相機權限，而且網頁使用 HTTPS。');
+  }
+});
+
+document.getElementById('stopBtn').addEventListener('click', () => {
+  if (!running) return;
+  running = false;
+  endAt = new Date();
+  clearInterval(timerHandle);
+  updateTimer();
+  document.getElementById('startBtn').disabled = false;
+  document.getElementById('stopBtn').disabled = true;
+  document.getElementById('saveBtn').disabled = false;
+  statusEl.textContent = `本次完成：${count} 次。可以儲存紀錄。`;
+});
+
+document.getElementById('saveBtn').addEventListener('click', async () => {
+  if (!startAt || !endAt) return alert('請先完成一次運動。');
+  if (GAS_URL.includes('PASTE_YOUR')) {
+    return alert('請先把 GAS Web App 網址貼到 HTML 的 GAS_URL。');
+  }
+
+  const durationSec = Math.max(0, Math.round((endAt-startAt)/1000));
+  const typeMap = {
+    march:'原地踏步',
+    leg_raise:'抬腿',
+    arm_raise:'抬手',
+    sit_stand:'坐下站起'
+  };
+  const payload = {
+    nickname: document.getElementById('nickname').value.trim(),
+    exerciseType: typeMap[exerciseEl.value],
+    count,
+    durationSec,
+    durationMin: +(durationSec/60).toFixed(2),
+    sessionDate: startAt.toLocaleDateString('zh-TW'),
+    startTime: startAt.toLocaleTimeString('zh-TW'),
+    endTime: endAt.toLocaleTimeString('zh-TW'),
+    notes: 'MediaPipe Pose CV'
+  };
+
+  statusEl.textContent = '正在儲存…';
+
+  try {
+    await fetch(GAS_URL, {
+      method:'POST',
+      mode:'no-cors',
+      headers:{'Content-Type':'text/plain;charset=utf-8'},
+      body:JSON.stringify(payload)
+    });
+    statusEl.textContent = '已送出紀錄到 Google Sheets。';
+    document.getElementById('saveBtn').disabled = true;
+  } catch(err) {
+    console.error(err);
+    statusEl.textContent = '儲存失敗，請檢查 GAS Web App 網址與部署權限。';
+  }
+});
+</script>
+</body>
+</html>
