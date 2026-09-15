@@ -1,0 +1,460 @@
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+  <title>銀髮運動 CV 紀錄</title>
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/drawing_utils/drawing_utils.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/pose/pose.js"></script>
+  <style>
+    :root { font-family: Arial, "Noto Sans TC", sans-serif; }
+    body { margin: 0; background: #f5f7f8; color: #222; }
+    .wrap { max-width: 760px; margin: 0 auto; padding: 18px; }
+    h1 { font-size: 30px; margin: 8px 0 18px; text-align:center; }
+    .card { background:#fff; border-radius:18px; padding:16px; margin-bottom:14px; box-shadow:0 2px 10px rgba(0,0,0,.08); }
+    label { display:block; font-size:22px; margin-bottom:8px; }
+    input, select, button {
+      width:100%; box-sizing:border-box; font-size:22px; padding:14px;
+      border-radius:14px; border:1px solid #bbb; margin-bottom:12px;
+    }
+    button { font-weight:700; cursor:pointer; }
+    .start { background:#1f8f4e; color:white; border:none; }
+    .stop { background:#c0392b; color:white; border:none; }
+    .save { background:#2257a6; color:white; border:none; }
+    .stats { display:grid; grid-template-columns:1fr 1fr; gap:12px; }
+    .stat { background:#eef3f6; border-radius:16px; padding:18px; text-align:center; }
+    .stat .n { font-size:42px; font-weight:800; }
+    .stat .t { font-size:18px; margin-top:4px; }
+    .videoBox { position:relative; width:100%; aspect-ratio:3/4; background:#111; overflow:hidden; border-radius:18px; }
+    video, canvas { position:absolute; inset:0; width:100%; height:100%; object-fit:cover; transform:scaleX(-1); }
+    #status { font-size:20px; line-height:1.5; }
+    .hint { font-size:17px; color:#555; line-height:1.5; }
+  </style>
+</head>
+<body>
+<div class="wrap">
+  <h1>銀髮運動 CV 紀錄</h1>
+
+  <div class="card">
+    <label for="nickname">長者暱稱</label>
+    <input id="nickname" placeholder="例如：王阿姨" />
+
+    <label for="exercise">選擇運動</label>
+    <select id="exercise">
+      <option value="march">原地踏步</option>
+      <option value="leg_raise">抬腿</option>
+      <option value="arm_raise">抬手</option>
+      <option value="sit_stand">坐下站起</option>
+    </select>
+
+    <label for="cameraSelect">攝影鏡頭</label>
+    <select id="cameraSelect">
+      <option value="">自動選擇較廣的後鏡頭</option>
+    </select>
+    <button type="button" id="switchCameraBtn">切換鏡頭</button>
+
+    <button class="start" id="startBtn">開始運動</button>
+    <button class="stop" id="stopBtn" disabled>停止</button>
+  </div>
+
+  <div class="card stats">
+    <div class="stat">
+      <div class="n" id="count">0</div>
+      <div class="t">次數</div>
+    </div>
+    <div class="stat">
+      <div class="n" id="timer">00:00</div>
+      <div class="t">運動時間</div>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="videoBox">
+      <video id="video" playsinline></video>
+      <canvas id="canvas"></canvas>
+    </div>
+    <p class="hint">請將手機固定，讓全身盡量入鏡。系統會優先嘗試後鏡頭；若手機瀏覽器提供多個鏡頭，可用「攝影鏡頭」或「切換鏡頭」尋找較廣角的鏡頭。</p>
+  </div>
+
+  <div class="card">
+    <div id="status">尚未開始。</div>
+    <button class="save" id="saveBtn" disabled>儲存本次紀錄</button>
+  </div>
+</div>
+
+<script>
+/*
+  ★ 部署 GAS Web App 後，把網址貼到這裡。
+  例如：https://script.google.com/macros/s/XXXXX/exec
+*/
+const GAS_URL = "https://script.google.com/macros/s/AKfycbxUfbDM3Sona4wqpA1Uym0E4jB6emk0ibgzDdbLZtsjJ-OOpR9cAubv1rNYRRcBw1J45g/exec";
+
+const video = document.getElementById('video');
+const canvas = document.getElementById('canvas');
+const ctx = canvas.getContext('2d');
+const countEl = document.getElementById('count');
+const timerEl = document.getElementById('timer');
+const statusEl = document.getElementById('status');
+const exerciseEl = document.getElementById('exercise');
+
+let pose, camera;
+let running = false;
+let count = 0;
+let startAt = null;
+let endAt = null;
+let timerHandle = null;
+let lastCountAt = 0;
+
+// 狀態鎖，避免一個動作連續重複計數
+let leftUp = false, rightUp = false, armsUp = false, seated = false;
+
+function angle(a, b, c) {
+  const ab = {x:a.x-b.x, y:a.y-b.y};
+  const cb = {x:c.x-b.x, y:c.y-b.y};
+  const dot = ab.x*cb.x + ab.y*cb.y;
+  const mag = Math.hypot(ab.x,ab.y) * Math.hypot(cb.x,cb.y);
+  if (!mag) return 0;
+  return Math.acos(Math.max(-1, Math.min(1, dot/mag))) * 180/Math.PI;
+}
+
+function canCount(ms=450) {
+  const now = Date.now();
+  if (now-lastCountAt < ms) return false;
+  lastCountAt = now;
+  return true;
+}
+
+function addCount(label) {
+  if (!running) return;
+  count++;
+  countEl.textContent = count;
+  statusEl.textContent = `偵測到：${label}，目前 ${count} 次`;
+}
+
+function detectExercise(lm) {
+  if (!running || !lm || lm.length < 33) return;
+
+  const LS=lm[11], RS=lm[12], LW=lm[15], RW=lm[16];
+  const LH=lm[23], RH=lm[24], LK=lm[25], RK=lm[26], LA=lm[27], RA=lm[28];
+
+  const type = exerciseEl.value;
+
+  // 抬手只需要肩膀與手腕，不要求全身入鏡
+  if (type === "arm_raise") {
+    const upperBody = [LS, RS, LW, RW];
+    if (upperBody.some(p => (p.visibility ?? 1) < 0.35)) {
+      statusEl.textContent = "請讓肩膀和雙手出現在畫面中。";
+      return;
+    }
+
+    // 左手或右手任一隻高過肩膀即可
+    const up = (LW.y < LS.y - 0.02) || (RW.y < RS.y - 0.02);
+    const down = (LW.y > LS.y + 0.06) && (RW.y > RS.y + 0.06);
+
+    if (up && !armsUp) {
+      armsUp = true;
+      statusEl.textContent = "已偵測到抬手，請把手放下。";
+    }
+    if (down && armsUp && canCount(350)) {
+      armsUp = false;
+      addCount("抬手");
+    }
+    return;
+  }
+
+  // 下肢運動才要求看到髖、膝、腳踝
+  const lowerBody = [LH,RH,LK,RK,LA,RA];
+  if (lowerBody.some(p => (p.visibility ?? 1) < 0.45)) {
+    statusEl.textContent = "這個運動需要看到髖部、膝蓋和腳踝，請退後一些。";
+    return;
+  }
+
+  if (type === "march" || type === "leg_raise") {
+    // 膝蓋抬高：膝蓋接近或高於髖部附近。
+    // 此門檻可依實測再調整。
+    const leftIsUp  = LK.y < LH.y + 0.10;
+    const rightIsUp = RK.y < RH.y + 0.10;
+    const leftDown  = LK.y > LH.y + 0.22;
+    const rightDown = RK.y > RH.y + 0.22;
+
+    if (leftIsUp && !leftUp) leftUp = true;
+    if (leftDown && leftUp && canCount(300)) {
+      leftUp = false;
+      addCount(type === "march" ? "左腳踏步" : "左腿抬腿");
+    }
+
+    if (rightIsUp && !rightUp) rightUp = true;
+    if (rightDown && rightUp && canCount(300)) {
+      rightUp = false;
+      addCount(type === "march" ? "右腳踏步" : "右腿抬腿");
+    }
+  }
+
+  if (type === "sit_stand") {
+    const leftKneeAngle  = angle(LH, LK, LA);
+    const rightKneeAngle = angle(RH, RK, RA);
+    const kneeAngle = (leftKneeAngle + rightKneeAngle) / 2;
+
+    // 坐姿約 70–120 度；站姿通常 >150 度
+    if (kneeAngle < 120) seated = true;
+    if (seated && kneeAngle > 155 && canCount(900)) {
+      seated = false;
+      addCount("坐下站起");
+    }
+  }
+}
+
+function onResults(results) {
+  canvas.width = video.videoWidth || 480;
+  canvas.height = video.videoHeight || 640;
+
+  ctx.save();
+  ctx.clearRect(0,0,canvas.width,canvas.height);
+  if (results.poseLandmarks) {
+    drawConnectors(ctx, results.poseLandmarks, POSE_CONNECTIONS, {lineWidth:3});
+    drawLandmarks(ctx, results.poseLandmarks, {lineWidth:2, radius:3});
+    detectExercise(results.poseLandmarks);
+  }
+  ctx.restore();
+}
+
+let stream = null;
+let videoDevices = [];
+let currentDeviceIndex = 0;
+let processing = false;
+let frameRequest = null;
+
+async function loadCameraList() {
+  // 首次授權後才能取得完整的鏡頭名稱
+  const devices = await navigator.mediaDevices.enumerateDevices();
+  videoDevices = devices.filter(d => d.kind === 'videoinput');
+
+  const select = document.getElementById('cameraSelect');
+  select.innerHTML = '';
+
+  if (!videoDevices.length) {
+    const opt = document.createElement('option');
+    opt.textContent = '找不到攝影鏡頭';
+    select.appendChild(opt);
+    return;
+  }
+
+  // 優先排序：後鏡頭，其次名稱含 wide / ultra / 0.6 等較廣角提示
+  const score = d => {
+    const n = (d.label || '').toLowerCase();
+    let v = 0;
+    if (/back|rear|environment|後/.test(n)) v += 20;
+    if (/ultra|wide|0\.6|0\.5|廣角/.test(n)) v += 30;
+    if (/front|user|前/.test(n)) v -= 20;
+    return v;
+  };
+  videoDevices.sort((a,b) => score(b) - score(a));
+
+  videoDevices.forEach((d, i) => {
+    const opt = document.createElement('option');
+    opt.value = d.deviceId;
+    opt.textContent = d.label || `鏡頭 ${i+1}`;
+    select.appendChild(opt);
+  });
+
+  currentDeviceIndex = 0;
+  select.selectedIndex = 0;
+}
+
+async function startSelectedCamera(deviceId = '') {
+  if (stream) {
+    stream.getTracks().forEach(t => t.stop());
+    stream = null;
+  }
+
+  // ideal 1280x720 + environment：要求瀏覽器優先給後鏡頭。
+  // 若手機瀏覽器暴露超廣角鏡頭，使用者可在下拉選單切換。
+  const videoConstraint = deviceId
+    ? {deviceId:{exact:deviceId}, width:{ideal:1280}, height:{ideal:720}}
+    : {facingMode:{ideal:'environment'}, width:{ideal:1280}, height:{ideal:720}};
+
+  stream = await navigator.mediaDevices.getUserMedia({
+    video: videoConstraint,
+    audio: false
+  });
+
+  video.srcObject = stream;
+  await video.play();
+}
+
+async function initPose() {
+  if (!pose) {
+    pose = new Pose({
+      locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/pose/${file}`
+    });
+    pose.setOptions({
+      modelComplexity: 1,
+      smoothLandmarks: true,
+      enableSegmentation: false,
+      minDetectionConfidence: 0.6,
+      minTrackingConfidence: 0.6
+    });
+    pose.onResults(onResults);
+  }
+
+  // 先要求一次相機權限，再取得手機實際提供給瀏覽器的所有鏡頭
+  if (!stream) {
+    await startSelectedCamera('');
+    await loadCameraList();
+
+    const selected = document.getElementById('cameraSelect').value;
+    if (selected) await startSelectedCamera(selected);
+  }
+
+  if (!frameRequest) processFrame();
+}
+
+async function processFrame() {
+  if (!pose || !video.srcObject) {
+    frameRequest = requestAnimationFrame(processFrame);
+    return;
+  }
+
+  if (!processing && video.readyState >= 2) {
+    processing = true;
+    try {
+      await pose.send({image: video});
+    } finally {
+      processing = false;
+    }
+  }
+  frameRequest = requestAnimationFrame(processFrame);
+}
+
+document.getElementById('cameraSelect').addEventListener('change', async (e) => {
+  if (!e.target.value) return;
+  try {
+    await startSelectedCamera(e.target.value);
+    currentDeviceIndex = e.target.selectedIndex;
+    statusEl.textContent = `已切換：${e.target.options[e.target.selectedIndex].text}`;
+  } catch (err) {
+    console.error(err);
+    statusEl.textContent = '鏡頭切換失敗。';
+  }
+});
+
+document.getElementById('switchCameraBtn').addEventListener('click', async () => {
+  if (!videoDevices.length) {
+    try {
+      await startSelectedCamera('');
+      await loadCameraList();
+    } catch (err) {
+      alert('無法取得攝影鏡頭。');
+      return;
+    }
+  }
+  if (videoDevices.length < 2) {
+    alert('瀏覽器目前只提供一個可用鏡頭。');
+    return;
+  }
+
+  currentDeviceIndex = (currentDeviceIndex + 1) % videoDevices.length;
+  const d = videoDevices[currentDeviceIndex];
+  document.getElementById('cameraSelect').value = d.deviceId;
+  try {
+    await startSelectedCamera(d.deviceId);
+    statusEl.textContent = `已切換：${d.label || '鏡頭 '+(currentDeviceIndex+1)}`;
+  } catch (err) {
+    console.error(err);
+    statusEl.textContent = '鏡頭切換失敗。';
+  }
+});
+function resetSession() {
+  count = 0;
+  countEl.textContent = '0';
+  leftUp = rightUp = armsUp = seated = false;
+  lastCountAt = 0;
+}
+
+function updateTimer() {
+  if (!running || !startAt) return;
+  const sec = Math.floor((Date.now()-startAt.getTime())/1000);
+  const m = String(Math.floor(sec/60)).padStart(2,'0');
+  const s = String(sec%60).padStart(2,'0');
+  timerEl.textContent = `${m}:${s}`;
+}
+
+document.getElementById('startBtn').addEventListener('click', async () => {
+  const nickname = document.getElementById('nickname').value.trim();
+  if (!nickname) return alert('請先輸入長者暱稱。');
+
+  try {
+    await initPose();
+    resetSession();
+    startAt = new Date();
+    endAt = null;
+    running = true;
+    document.getElementById('startBtn').disabled = true;
+    document.getElementById('stopBtn').disabled = false;
+    document.getElementById('saveBtn').disabled = true;
+    statusEl.textContent = '辨識中，請開始動作。';
+    clearInterval(timerHandle);
+    timerHandle = setInterval(updateTimer, 500);
+  } catch(err) {
+    console.error(err);
+    alert('無法開啟攝影機。請確認瀏覽器已允許相機權限，而且網頁使用 HTTPS。');
+  }
+});
+
+document.getElementById('stopBtn').addEventListener('click', () => {
+  if (!running) return;
+  running = false;
+  endAt = new Date();
+  clearInterval(timerHandle);
+  updateTimer();
+  document.getElementById('startBtn').disabled = false;
+  document.getElementById('stopBtn').disabled = true;
+  document.getElementById('saveBtn').disabled = false;
+  statusEl.textContent = `本次完成：${count} 次。可以儲存紀錄。`;
+});
+
+document.getElementById('saveBtn').addEventListener('click', async () => {
+  if (!startAt || !endAt) return alert('請先完成一次運動。');
+  if (GAS_URL.includes('PASTE_YOUR')) {
+    return alert('請先把 GAS Web App 網址貼到 HTML 的 GAS_URL。');
+  }
+
+  const durationSec = Math.max(0, Math.round((endAt-startAt)/1000));
+  const typeMap = {
+    march:'原地踏步',
+    leg_raise:'抬腿',
+    arm_raise:'抬手',
+    sit_stand:'坐下站起'
+  };
+  const payload = {
+    nickname: document.getElementById('nickname').value.trim(),
+    exerciseType: typeMap[exerciseEl.value],
+    count,
+    durationSec,
+    durationMin: +(durationSec/60).toFixed(2),
+    sessionDate: startAt.toLocaleDateString('zh-TW'),
+    startTime: startAt.toLocaleTimeString('zh-TW'),
+    endTime: endAt.toLocaleTimeString('zh-TW'),
+    notes: 'MediaPipe Pose CV'
+  };
+
+  statusEl.textContent = '正在儲存…';
+
+  try {
+    await fetch(GAS_URL, {
+      method:'POST',
+      mode:'no-cors',
+      headers:{'Content-Type':'text/plain;charset=utf-8'},
+      body:JSON.stringify(payload)
+    });
+    statusEl.textContent = '已送出紀錄到 Google Sheets。';
+    document.getElementById('saveBtn').disabled = true;
+  } catch(err) {
+    console.error(err);
+    statusEl.textContent = '儲存失敗，請檢查 GAS Web App 網址與部署權限。';
+  }
+});
+</script>
+</body>
+</html>
